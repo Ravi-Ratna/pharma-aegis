@@ -9,7 +9,7 @@ class SensorReading:
     temperature: float
     humidity: float
     vibration: float
-    fire: int = 0  # 0 = safe, 1 = fire detected
+    fire: int = 0  # 1 = normal/safe, any other value = fire detected
 
 
 @dataclass

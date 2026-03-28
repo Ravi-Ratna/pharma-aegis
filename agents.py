@@ -42,7 +42,7 @@ sensor_history = deque(maxlen=30)
 
 def data_analyzer(reading: SensorReading) -> AnalysisResult:
     """Analyze raw sensor data and determine status with compliance and recommendations"""
-    
+
     # Add current reading to history for trend analysis
     sensor_history.append({
         "temperature": reading.temperature,
@@ -50,7 +50,7 @@ def data_analyzer(reading: SensorReading) -> AnalysisResult:
         "vibration": reading.vibration,
         "fire": reading.fire,
     })
-    
+
     # Temperature analysis (Pharma storage: 18-25°C optimal)
     if reading.temperature < TEMP_WARN_LOW:
         temperature_status = "too_cold"
@@ -110,9 +110,10 @@ def data_analyzer(reading: SensorReading) -> AnalysisResult:
         vibration_compliance = 40
 
     # Fire detection (highest priority)
-    fire_status = "detected" if reading.fire == 1 else "safe"
-    fire_score = 5 if reading.fire == 1 else 0
-    fire_compliance = 0 if reading.fire == 1 else 100
+    # Sensor logic: value == 1 means NORMAL (no fire), any other value means FIRE DETECTED
+    fire_status = "safe" if reading.fire == 1 else "detected"
+    fire_score = 0 if reading.fire == 1 else 5
+    fire_compliance = 100 if reading.fire == 1 else 0
 
     # Calculate overall compliance score (0-100%)
     compliance_score = int(
@@ -147,7 +148,7 @@ def data_analyzer(reading: SensorReading) -> AnalysisResult:
 def _calculate_trends() -> dict:
     """Calculate trends from sensor history"""
     trends = {}
-    
+
     if len(sensor_history) < 2:
         # Not enough data yet, return stable trends
         return {
@@ -155,20 +156,20 @@ def _calculate_trends() -> dict:
             "humidity": ("stable", 0.0),
             "vibration": ("stable", 0.0),
         }
-    
+
     # Get first and last readings
     first_reading = sensor_history[0]
     last_reading = sensor_history[-1]
-    
+
     for param in ["temperature", "humidity", "vibration"]:
         old_value = first_reading[param]
         new_value = last_reading[param]
-        
+
         if old_value == 0:
             change_pct = 0.0
         else:
             change_pct = ((new_value - old_value) / old_value) * 100
-        
+
         # Determine trend direction
         if change_pct > 1.0:
             trend = "rising"
@@ -176,18 +177,18 @@ def _calculate_trends() -> dict:
             trend = "falling"
         else:
             trend = "stable"
-        
+
         trends[param] = (trend, round(change_pct, 1))
-    
+
     return trends
 
 
-def _generate_recommendations(reading: SensorReading, temp_status: str, 
-                             humidity_status: str, vibration_status: str, 
+def _generate_recommendations(reading: SensorReading, temp_status: str,
+                             humidity_status: str, vibration_status: str,
                              fire_status: str) -> list:
     """Generate actionable recommendations based on sensor analysis"""
     recommendations = []
-    
+
     # Temperature recommendations
     if temp_status == "too_cold":
         recommendations.append("⚠️ Increase room temperature - below safety threshold")
@@ -196,7 +197,7 @@ def _generate_recommendations(reading: SensorReading, temp_status: str,
     elif temp_status == "cool" or temp_status == "warm":
         diff = TEMP_OPTIMAL_MIN - reading.temperature if temp_status == "cool" else reading.temperature - TEMP_OPTIMAL_MAX
         recommendations.append(f"🔧 Adjust temperature by ~{diff:.1f}°C toward optimal range")
-    
+
     # Humidity recommendations
     if humidity_status == "too_dry":
         recommendations.append("💧 Increase humidity - air too dry for pharmaceutical products")
@@ -204,24 +205,24 @@ def _generate_recommendations(reading: SensorReading, temp_status: str,
         recommendations.append("💨 Reduce humidity immediately - moisture levels too high")
     elif humidity_status == "dry" or humidity_status == "humid":
         recommendations.append("🎯 Fine-tune humidity control systems for stability")
-    
+
     # Vibration recommendations
     if vibration_status == "elevated":
         recommendations.append("🔧 Inspect equipment - vibration levels elevated")
     elif vibration_status == "high":
         recommendations.append("🚨 Check equipment immediately - abnormal vibration detected")
-    
+
     # Fire recommendations
     if fire_status == "detected":
         recommendations.append("🚨 EMERGENCY: Fire detected - activate emergency protocols immediately!")
-    
+
     # Limit to 3 recommendations
     return recommendations[:3]
 
 
 def risk_evaluator(analysis: AnalysisResult) -> RiskResult:
     """Evaluate risk based on analysis with scoring and confidence metrics"""
-    
+
     if analysis.fire_status == "detected":
         return RiskResult(
             risk_level="CRITICAL",
@@ -234,7 +235,7 @@ def risk_evaluator(analysis: AnalysisResult) -> RiskResult:
     # Higher anomaly score = lower compliance = higher risk
     risk_score = (100.0 - analysis.compliance_score) * (analysis.anomaly_score / 10.0)
     risk_score = min(100.0, max(5.0, risk_score))  # Clamp between 5 and 100
-    
+
     # Confidence decreases slightly if we're right at threshold boundaries
     base_confidence = 0.95
     confidence = max(0.85, base_confidence - (abs(analysis.anomaly_score - 2.5) * 0.02))
@@ -273,7 +274,7 @@ def risk_evaluator(analysis: AnalysisResult) -> RiskResult:
 
 def decision_agent(risk: RiskResult) -> DecisionResult:
     """Make decision based on risk assessment with urgency levels"""
-    
+
     if risk.risk_level == "CRITICAL":
         return DecisionResult(
             decision="TRIGGER_EMERGENCY",
@@ -302,10 +303,10 @@ def decision_agent(risk: RiskResult) -> DecisionResult:
     )
 
 
-def action_agent(decision: DecisionResult, risk: RiskResult, 
+def action_agent(decision: DecisionResult, risk: RiskResult,
                  analysis: AnalysisResult) -> ActionResult:
     """Generate action outputs for external systems (LED, buzzer, logging)"""
-    
+
     # Determine LED state based on risk level
     if risk.risk_level == "CRITICAL":
         led_state = "RED_BLINK"
@@ -323,7 +324,7 @@ def action_agent(decision: DecisionResult, risk: RiskResult,
         led_state = "GREEN_SOLID"
         buzzer_state = "OFF"
         log_level = "INFO"
-    
+
     # Generate log message
     if analysis.fire_status == "detected":
         log_message = "🚨 FIRE DETECTED - Emergency protocols activated"
@@ -335,7 +336,7 @@ def action_agent(decision: DecisionResult, risk: RiskResult,
         log_message = f"Minor anomaly detected (score: {analysis.anomaly_score}) - {decision.decision}"
     else:
         log_message = f"System operating normally (compliance: {analysis.compliance_score}%)"
-    
+
     return ActionResult(
         led=led_state,
         buzzer=buzzer_state,
@@ -349,11 +350,11 @@ def run_analysis_pipeline():
     print("\n" + "="*60)
     print("🏥 PHARMA AEGIS ANALYSIS PIPELINE")
     print("="*60)
-    
+
     # Get latest sensor data
     sensor_data = get_latest_sensor_data()
     print(f"\n📊 Raw Sensor Data: {sensor_data}")
-    
+
     # Create reading object
     reading = SensorReading(
         temperature=float(sensor_data.get("temperature", 20)),
@@ -361,7 +362,7 @@ def run_analysis_pipeline():
         vibration=float(sensor_data.get("vibration", 1.0)),
         fire=int(sensor_data.get("fire", 0))
     )
-    
+
     # Run analysis
     analysis = data_analyzer(reading)
     print(f"\n🔍 Analysis:")
@@ -370,18 +371,18 @@ def run_analysis_pipeline():
     print(f"   Vibration: {analysis.vibration_status}")
     print(f"   Fire: {analysis.fire_status}")
     print(f"   Anomaly Score: {analysis.anomaly_score}")
-    
+
     # Evaluate risk
     risk = risk_evaluator(analysis)
     print(f"\n⚠️  Risk Assessment:")
     print(f"   Level: {risk.risk_level}")
     print(f"   Reason: {risk.reason}")
-    
+
     # Make decision
     decision = decision_agent(risk)
     print(f"\n✅ Decision:")
     print(f"   Action: {decision.decision}")
     print(f"   Human Review: {'Required' if decision.requires_human else 'Not required'}")
     print("="*60 + "\n")
-    
+
     return analysis, risk, decision

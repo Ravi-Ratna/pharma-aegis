@@ -13,11 +13,18 @@ app = Flask(__name__)
 PORT = 'COM5'
 BAUD = 115200
 
+# ── Arduino Door Controller serial config ────────────────────────────────────
+# Change ARDUINO_PORT to whichever COM port your Arduino is on
+ARDUINO_PORT = 'COM6'
+ARDUINO_BAUD = 9600
+
 ser = None
+arduino_ser = None
+arduino_lock = Lock()
 latest_data = {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": "N/A"}
 latest_analysis = {
     "sensor_data": {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": ""},
-    "analysis": {"temperature": "normal", "humidity": "normal", "vibration": "normal", "fire": "safe", "anomaly_score": 0},
+    "analysis": {"vibration": "normal", "fire": "safe", "anomaly_score": 0},
     "risk": {"level": "LOW", "reason": "Initializing..."},
     "decision": {"action": "MONITOR", "requires_human": False},
     "action": {"led": "GREEN_SOLID", "buzzer": "OFF", "log_level": "INFO", "log_message": "Initializing..."}
@@ -26,11 +33,48 @@ data_lock = Lock()
 connection_status = "⏳ Initializing..."
 
 
+def connect_arduino():
+    """Try to open a serial connection to the Arduino door controller."""
+    global arduino_ser
+    try:
+        arduino_ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        time.sleep(2)  # Wait for Arduino bootloader to finish
+        print(f"✅ Arduino door controller connected on {ARDUINO_PORT}")
+    except Exception as e:
+        print(f"⚠️  Arduino not found on {ARDUINO_PORT}: {e}")
+        print(f"   → Door controller commands will be skipped until reconnected")
+        arduino_ser = None
+
+
+def send_arduino_command(door: str, led: str):
+    """Send a JSON command line to the Arduino door controller.
+
+    Args:
+        door: "open" | "close"
+        led:  "red"  | "green" | "off"
+    """
+    global arduino_ser
+    cmd = json.dumps({"door": door, "led": led}) + "\n"
+
+    with arduino_lock:
+        if arduino_ser and arduino_ser.is_open:
+            try:
+                arduino_ser.write(cmd.encode())
+            except Exception as e:
+                print(f"⚠️  Arduino send error: {e} — will skip future commands")
+                try:
+                    arduino_ser.close()
+                except Exception:
+                    pass
+                arduino_ser = None
+        # Silently skip if Arduino is not connected
+
+
 def run_agent_pipeline(sensor_payload):
     """Run all 4 agents and build a normalized output bundle."""
     # Handle ESP32 data format conversion: "air" -> synthetic temperature/humidity
     air_quality = float(sensor_payload.get("air", 400.0))  # Default ~400 ppm CO2
-    
+
     # Convert air quality to synthetic temperature/humidity for analysis
     # Higher air quality value = more CO2/contaminants = simulate temp/humidity stress
     if air_quality < 350:  # Very clean air
@@ -48,7 +92,7 @@ def run_agent_pipeline(sensor_payload):
     else:  # Poor air quality
         synth_temp = 28.0
         synth_humid = 80.0
-    
+
     reading = SensorReading(
         temperature=float(sensor_payload.get("temperature", synth_temp)),
         humidity=float(sensor_payload.get("humidity", synth_humid)),
@@ -61,6 +105,21 @@ def run_agent_pipeline(sensor_payload):
     decision = decision_agent(risk)
     action = action_agent(decision, risk, analysis)
 
+    # ── Arduino door & LED commands derived from agent analysis ──────────────
+    # Door: close on elevated or high vibration, open when normal
+    door_cmd = "close" if analysis.vibration_status in ("elevated", "high") else "open"
+
+    # LED: red on high humidity, green on low humidity, off when optimal
+    if analysis.humidity_status in ("humid", "too_humid"):
+        led_cmd = "red"
+    elif analysis.humidity_status in ("dry", "too_dry"):
+        led_cmd = "green"
+    else:
+        led_cmd = "off"
+
+    send_arduino_command(door_cmd, led_cmd)
+    print(f"🚪 Arduino | Door: {door_cmd.upper()} | LED: {led_cmd.upper()}")
+
     # Include original ESP32 data in response (air quality, fire, vibration)
     sensor_data_out = {
         "air_quality": air_quality,
@@ -72,16 +131,12 @@ def run_agent_pipeline(sensor_payload):
     return {
         "sensor_data": sensor_data_out,
         "analysis": {
-            "temperature": analysis.temperature_status,
-            "humidity": analysis.humidity_status,
             "vibration": analysis.vibration_status,
             "fire": analysis.fire_status,
             "anomaly_score": analysis.anomaly_score,
             "compliance_score": analysis.compliance_score,
             "recommendations": analysis.recommendations,
             "trends": {
-                "temperature": {"trend": analysis.trends.get("temperature", ("stable", 0))[0], "change_pct": round(analysis.trends.get("temperature", ("stable", 0))[1], 1)},
-                "humidity": {"trend": analysis.trends.get("humidity", ("stable", 0))[0], "change_pct": round(analysis.trends.get("humidity", ("stable", 0))[1], 1)},
                 "vibration": {"trend": analysis.trends.get("vibration", ("stable", 0))[0], "change_pct": round(analysis.trends.get("vibration", ("stable", 0))[1], 1)},
             }
         },
@@ -110,7 +165,7 @@ def find_com_ports():
     if platform.system() == 'Windows':
         import winreg
         try:
-            reg = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, 
+            reg = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE,
                                    r"HARDWARE\DEVICEMAP\SERIALCOMM")
             for i in range(winreg.QueryInfoKey(reg)[1]):
                 try:
@@ -123,7 +178,7 @@ def find_com_ports():
     elif platform.system() == 'Linux':
         import glob
         ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-    
+
     return ports if ports else ["COM1", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9"]
 
 
@@ -540,11 +595,11 @@ DASHBOARD_HTML = """
 
         function updateData() {
             const eventSource = new EventSource('/stream');
-            
+
             eventSource.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
-                    
+
                     // Sensor Readings
                     const sensorHtml = Object.entries(data.sensor_data || {})
                         .filter(([k]) => !['timestamp'].includes(k))
@@ -552,14 +607,14 @@ DASHBOARD_HTML = """
                             const formatted = typeof value === 'number' ? value.toFixed(2) : value;
                             let unit = '';
                             let label = key.replace(/_/g, ' ').toUpperCase();
-                            
+
                             if (key === 'air_quality') {
                                 unit = 'ppm';
                                 label = 'AIR QUALITY';
                             } else if (key === 'vibration') {
                                 unit = 'g';
                             }
-                            
+
                             return `
                                 <div class="reading-row">
                                     <span class="reading-label">${label}</span>
@@ -571,14 +626,14 @@ DASHBOARD_HTML = """
                             `;
                         }).join('');
                     document.getElementById('sensorReadings').innerHTML = sensorHtml || '<div style="color: #ccc; text-align: center; padding: 20px;">No data</div>';
-                    
+
                     // Compliance Score
                     const analysis = data.analysis || {};
                     const compliance = analysis.compliance_score || 100;
                     const complianceClass = getComplianceClass(compliance);
                     document.getElementById('complianceCircle').className = `compliance-circle ${complianceClass}`;
                     document.getElementById('complianceCircle').textContent = compliance + '%';
-                    
+
                     // Trends
                     const trends = analysis.trends || {};
                     const trendsHtml = Object.entries(trends).map(([key, val]) => {
@@ -594,10 +649,10 @@ DASHBOARD_HTML = """
                         `;
                     }).join('');
                     document.getElementById('trendsDisplay').innerHTML = trendsHtml || '<div style="color: #ccc; text-align: center;">No trend data</div>';
-                    
+
                     // Analysis Results
                     const analysisHtml = Object.entries(analysis)
-                        .filter(([k]) => !['anomaly_score', 'compliance_score', 'recommendations', 'trends'].includes(k))
+                        .filter(([k]) => !['anomaly_score', 'compliance_score', 'recommendations', 'trends', 'temperature', 'humidity'].includes(k))
                         .map(([key, value]) => `
                             <div class="reading-row">
                                 <span class="reading-label">${key.replace(/_/g, ' ').toUpperCase()}</span>
@@ -610,7 +665,7 @@ DASHBOARD_HTML = """
                         </div>
                     `;
                     document.getElementById('analysisResults').innerHTML = analysisHtml || '<div style="color: #ccc; text-align: center;">Analyzing...</div>';
-                    
+
                     // Risk Assessment
                     const risk = data.risk || {};
                     const riskClass = getRiskClass(risk.level);
@@ -619,22 +674,22 @@ DASHBOARD_HTML = """
                     document.getElementById('riskReason').textContent = risk.reason || '--';
                     document.getElementById('riskScore').textContent = (risk.risk_score || 0).toFixed(0);
                     document.getElementById('confidence').textContent = ((risk.confidence || 0) * 100).toFixed(0) + '%';
-                    
+
                     // Decision
                     const decision = data.decision || {};
                     document.getElementById('decision').textContent = decision.action || '--';
                     document.getElementById('urgency').textContent = '🎚️ ' + (decision.urgency || 'low').toUpperCase();
-                    document.getElementById('humanReview').textContent = decision.requires_human 
-                        ? '👤 Human Review Required' 
+                    document.getElementById('humanReview').textContent = decision.requires_human
+                        ? '👤 Human Review Required'
                         : '✅ Autonomous Control';
-                    
+
                     // Recommendations
                     const recs = analysis.recommendations || [];
-                    const recsHtml = recs.length > 0 
+                    const recsHtml = recs.length > 0
                         ? recs.map(rec => `<div class="recommendation-item">${rec}</div>`).join('')
                         : '<div class="recommendation-item" style="color: #999;">No recommendations at this time</div>';
                     document.getElementById('recommendationsBox').innerHTML = recsHtml;
-                    
+
                     // Status
                     document.getElementById('status').textContent = '✅ Connected & Monitoring (Real-time ESP32 Data)';
                     document.getElementById('timestamp').textContent = new Date().toLocaleTimeString();
@@ -642,12 +697,12 @@ DASHBOARD_HTML = """
                     console.error('Error:', e);
                 }
             };
-            
+
             eventSource.onerror = function() {
                 document.getElementById('status').textContent = '⏳ Reconnecting...';
             };
         }
-        
+
         updateData();
     </script>
 </body>
@@ -657,7 +712,7 @@ DASHBOARD_HTML = """
 def read_sensor():
     """Background thread to continuously read sensor data from ESP32 - REAL DATA ONLY"""
     global ser, latest_data, latest_analysis, connection_status, PORT
-    
+
     preferred_port = find_preferred_port()
     available_ports = find_com_ports()
     if preferred_port and preferred_port in available_ports:
@@ -667,7 +722,7 @@ def read_sensor():
         available_ports.insert(0, preferred_port)
 
     print(f"Available COM ports: {available_ports}")
-    
+
     # Try each port until one works
     for attempt_port in available_ports:
         try:
@@ -705,11 +760,11 @@ def read_sensor():
                         try:
                             data = json.loads(line)
                             data['timestamp'] = time.strftime('%H:%M:%S')
-                            
+
                             with data_lock:
                                 latest_data = data.copy()
                                 latest_analysis = run_agent_pipeline(data)
-                            
+
                             print(f"✅ Updated: {latest_data}")
                             print(
                                 f"🧠 Agents | Risk: {latest_analysis['risk']['level']} "
@@ -732,7 +787,7 @@ def read_sensor():
             ser = None
             connection_status = f"❌ Port {attempt_port} failed: {str(e)[:50]}"
             time.sleep(1)  # Wait before trying next port
-    
+
     if not ser:
         print(f"\n⚠️  Could not connect to any serial port!")
         print(f"📝 Troubleshooting:")
@@ -784,17 +839,22 @@ def stream():
                 }
             yield f"data: {json.dumps(response_data)}\n\n"
             time.sleep(0.5)
-    
+
     return app.response_class(generate(), mimetype='text/event-stream')
 
 
 if __name__ == "__main__":
-    # Start sensor reading in background thread
+    # Connect to Arduino door controller (non-blocking — failure is OK)
+    arduino_thread = Thread(target=connect_arduino, daemon=True)
+    arduino_thread.start()
+
+    # Start ESP32 sensor reading in background thread
     sensor_thread = Thread(target=read_sensor, daemon=True)
     sensor_thread.start()
-    
+
     print("\n🚀 Starting Pharma Aegis Dashboard...")
     print("📊 Open your browser: http://localhost:5000")
+    print(f"🚪 Arduino door controller port: {ARDUINO_PORT}")
     print("=" * 50)
-    
+
     app.run(host="0.0.0.0", port=5000, debug=False)
