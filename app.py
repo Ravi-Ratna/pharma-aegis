@@ -5,25 +5,65 @@ import time
 from threading import Thread, Lock
 import platform
 import random
-from agents import data_analyzer, risk_evaluator, decision_agent
+from agents import data_analyzer, risk_evaluator, decision_agent, action_agent
 from models import SensorReading
 
 app = Flask(__name__)
 
 PORT = 'COM5'
 BAUD = 115200
-DEMO_MODE = True  # Set to True to use fake data for testing
+DEMO_MODE = False  # Use real serial sensor data by default
 
 ser = None
 latest_data = {"status": "Waiting for connection...", "timestamp": "N/A"}
 latest_analysis = {
     "analysis": {"temperature": "normal", "humidity": "normal", "vibration": "normal", "fire": "safe", "anomaly_score": 0},
     "risk": {"level": "LOW", "reason": "Initializing..."},
-    "decision": {"action": "MONITOR", "requires_human": False}
+    "decision": {"action": "MONITOR", "requires_human": False},
+    "action": {"led": "GREEN_SOLID", "buzzer": "OFF", "log_level": "INFO", "log_message": "Initializing..."}
 }
 data_lock = Lock()
 connection_status = "⏳ Initializing..."
 demo_enabled = DEMO_MODE
+
+
+def run_agent_pipeline(sensor_payload):
+    """Run all 4 agents and build a normalized output bundle."""
+    reading = SensorReading(
+        temperature=float(sensor_payload.get("temperature", 20.0)),
+        humidity=float(sensor_payload.get("humidity", 50.0)),
+        vibration=float(sensor_payload.get("vibration", 1.0)),
+        fire=int(sensor_payload.get("fire", 1)),
+    )
+
+    analysis = data_analyzer(reading)
+    risk = risk_evaluator(analysis)
+    decision = decision_agent(risk)
+    action = action_agent(decision, risk, analysis)
+
+    return {
+        "analysis": {
+            "temperature": analysis.temperature_status,
+            "humidity": analysis.humidity_status,
+            "vibration": analysis.vibration_status,
+            "fire": analysis.fire_status,
+            "anomaly_score": analysis.anomaly_score,
+        },
+        "risk": {
+            "level": risk.risk_level,
+            "reason": risk.reason,
+        },
+        "decision": {
+            "action": decision.decision,
+            "requires_human": decision.requires_human,
+        },
+        "action": {
+            "led": action.led,
+            "buzzer": action.buzzer,
+            "log_level": action.log_level,
+            "log_message": action.log_message,
+        },
+    }
 
 def find_com_ports():
     """Find available COM ports"""
@@ -46,6 +86,26 @@ def find_com_ports():
         ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
     
     return ports if ports else ["COM1", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9"]
+
+
+def find_preferred_port():
+    """Prefer the actual USB serial device when available."""
+    try:
+        from serial.tools import list_ports
+        detected = list(list_ports.comports())
+        if not detected:
+            return None
+
+        # Prefer common USB bridge identifiers used by ESP boards.
+        preferred_keywords = ("CH910", "CH340", "CP210", "USB", "UART", "Silicon Labs")
+        for p in detected:
+            desc = (p.description or "").upper()
+            if any(keyword.upper() in desc for keyword in preferred_keywords):
+                return p.device
+
+        return detected[0].device
+    except Exception:
+        return None
 
 # 🌐 HTML Dashboard
 DASHBOARD_HTML = """
@@ -357,7 +417,7 @@ def read_sensor():
                 temp = round(22 + random.uniform(-2, 2), 2)
                 humid = round(55 + random.uniform(-10, 10), 2)
                 vib = round(random.uniform(0.5, 2.5), 3)
-                fire = 0
+                fire = 1
                 
                 latest_data = {
                     "temperature": temp,
@@ -366,63 +426,54 @@ def read_sensor():
                     "fire": fire,
                     "timestamp": time.strftime('%H:%M:%S')
                 }
-                
-                # Run analysis
-                reading = SensorReading(
-                    temperature=temp,
-                    humidity=humid,
-                    vibration=vib,
-                    fire=fire
-                )
-                analysis = data_analyzer(reading)
-                risk = risk_evaluator(analysis)
-                decision = decision_agent(risk)
-                
-                latest_analysis = {
-                    "analysis": {
-                        "temperature": analysis.temperature_status,
-                        "humidity": analysis.humidity_status,
-                        "vibration": analysis.vibration_status,
-                        "fire": analysis.fire_status,
-                        "anomaly_score": analysis.anomaly_score
-                    },
-                    "risk": {
-                        "level": risk.risk_level,
-                        "reason": risk.reason
-                    },
-                    "decision": {
-                        "action": decision.decision,
-                        "requires_human": decision.requires_human
-                    }
-                }
-            print(f"[DEMO #{demo_counter}] Temp: {temp}°C, Humidity: {humid}%, Vibration: {vib} | Risk: {risk.risk_level}")
+
+                latest_analysis = run_agent_pipeline(latest_data)
+
+            print(
+                f"[DEMO #{demo_counter}] Temp: {temp}°C, Humidity: {humid}%, Vibration: {vib} "
+                f"| Risk: {latest_analysis['risk']['level']} "
+                f"| LED: {latest_analysis['action']['led']} "
+                f"| Buzzer: {latest_analysis['action']['buzzer']}"
+            )
             time.sleep(1)
         return
     
+    preferred_port = find_preferred_port()
     available_ports = find_com_ports()
+    if preferred_port and preferred_port in available_ports:
+        available_ports.remove(preferred_port)
+        available_ports.insert(0, preferred_port)
+    elif preferred_port and preferred_port not in available_ports:
+        available_ports.insert(0, preferred_port)
+
     print(f"Available COM ports: {available_ports}")
     
     # Try each port until one works
     for attempt_port in available_ports:
         try:
+            PORT = attempt_port
             print(f"🔍 Attempting to connect to {attempt_port}...")
             ser = serial.Serial(attempt_port, BAUD, timeout=1)
-            PORT = attempt_port
             print(f"✅ Serial connected on {PORT}")
             connection_status = f"✅ Connected on {PORT}"
 
             time.sleep(5)  # 🔥 wait for ESP reset
             print("⏳ Waiting for ESP READY signal...")
 
-            # 🔥 wait until ESP says READY (with timeout)
+            # Wait until ESP says READY or starts sending JSON.
             start = time.time()
+            ready_seen = False
             while time.time() - start < 10:
                 if ser.in_waiting > 0:
                     line = ser.readline().decode('utf-8', errors='ignore').strip()
                     print("INIT:", line)
                     if "READY" in line or line.startswith("{"):
                         print("✅ ESP Active")
+                        ready_seen = True
                         break
+
+            if not ready_seen:
+                print("⚠️ READY signal not seen in 10s, continuing to read stream...")
 
             # Now read sensor data in a loop
             while True:
@@ -436,7 +487,15 @@ def read_sensor():
                             with data_lock:
                                 latest_data = data
                                 latest_data['timestamp'] = time.strftime('%H:%M:%S')
+                                latest_analysis = run_agent_pipeline(latest_data)
                             print(f"✅ Updated: {latest_data}")
+                            print(
+                                f"🧠 Agents | Risk: {latest_analysis['risk']['level']} "
+                                f"| Decision: {latest_analysis['decision']['action']} "
+                                f"| LED: {latest_analysis['action']['led']} "
+                                f"| Buzzer: {latest_analysis['action']['buzzer']}"
+                            )
+                            print(f"📝 {latest_analysis['action']['log_level']}: {latest_analysis['action']['log_message']}")
                         except Exception as e:
                             print(f"Parse error: {e}")
             break  # Exit port loop if successful
@@ -500,6 +559,7 @@ def stream():
                     "analysis": latest_analysis["analysis"] if latest_analysis else {},
                     "risk": latest_analysis["risk"] if latest_analysis else {},
                     "decision": latest_analysis["decision"] if latest_analysis else {},
+                    "action": latest_analysis["action"] if latest_analysis else {},
                     "demo_mode": demo_enabled
                 }
             yield f"data: {json.dumps(response_data)}\n\n"

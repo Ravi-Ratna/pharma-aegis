@@ -6,7 +6,7 @@ def run_system():
     print("\n🚀 Starting Pharma Aegis Analysis System\n")
     
     # Run the analysis pipeline
-    analysis, risk, decision = run_analysis_pipeline()
+    analysis, risk, decision, action = run_analysis_pipeline()
     
     # Additional logic based on decision
     if decision.decision == "TRIGGER_EMERGENCY":
@@ -17,6 +17,8 @@ def run_system():
         print("🔍 Manual inspection recommended - Check warehouse conditions")
     else:
         print("✅ System operating normally - Continuing to monitor")
+
+    print(f"🛠️  Action Output -> LED: {action.led}, Buzzer: {action.buzzer}")
 
 
 if __name__ == "__main__":
