@@ -25,12 +25,19 @@ PORT = '/dev/ttyUSB0'
 BAUD = 115200
 
 # ── Raspberry Pi GPIO pin config (BCM numbering) ─────────────────────────────
-GPIO_LED_RED   = 17   # Physical pin 11  →  Red LED   (high humidity)
-GPIO_LED_GREEN = 27   # Physical pin 13  →  Green LED (low humidity)
-GPIO_SERVO     = 18   # Physical pin 12  →  Servo signal (hardware PWM)
+GPIO_LED_RED    = 17   # Physical pin 11  →  Red LED    (bad air quality)
+GPIO_LED_YELLOW = 22   # Physical pin 15  →  Yellow LED (medium air quality)
+GPIO_LED_GREEN  = 27   # Physical pin 13  →  Green LED  (good air quality)
+GPIO_SERVO      = 18   # Physical pin 12  →  Servo signal (hardware PWM)
+
+# ── Air quality LED thresholds (MQ-135 ADC value) ────────────────────────────
+AIR_QUALITY_GOOD   = 450   # below this        → Green  (clean air)
+AIR_QUALITY_MEDIUM = 800   # 450–800           → Yellow (moderate)
+                           # 800 and above     → Red    (poor air)
 
 ser = None
 _red_led     = None   # gpiozero LED object
+_yellow_led  = None   # gpiozero LED object
 _green_led   = None   # gpiozero LED object
 _door_servo  = None   # gpiozero AngularServo object
 _servo_angle = 0      # tracks current angle so sweep knows where to start
@@ -47,13 +54,14 @@ connection_status = "⏳ Initializing..."
 
 
 def setup_gpio():
-    """Initialise gpiozero devices for the servo and both LEDs."""
-    global _red_led, _green_led, _door_servo
+    """Initialise gpiozero devices for the servo and all three LEDs."""
+    global _red_led, _yellow_led, _green_led, _door_servo
     if not GPIO_AVAILABLE:
         print("⚠️  gpiozero not available — GPIO disabled (running in dev mode)")
         return
-    _red_led   = LED(GPIO_LED_RED)
-    _green_led = LED(GPIO_LED_GREEN)
+    _red_led    = LED(GPIO_LED_RED)
+    _yellow_led = LED(GPIO_LED_YELLOW)
+    _green_led  = LED(GPIO_LED_GREEN)
     # AngularServo: min_angle=0 (door open), max_angle=90 (door closed)
     # Pulse widths tuned for SG90 / MG90S servos — common with Pi projects
     _door_servo = AngularServo(GPIO_SERVO,
@@ -61,8 +69,9 @@ def setup_gpio():
                                min_pulse_width=0.001, max_pulse_width=0.002)
     _door_servo.angle = 0   # park door open on boot
     print(f"✅ GPIO ready — Pi 4B | "
-          f"Red LED → GPIO{GPIO_LED_RED} | "
-          f"Green LED → GPIO{GPIO_LED_GREEN} | "
+          f"Red → GPIO{GPIO_LED_RED} | "
+          f"Yellow → GPIO{GPIO_LED_YELLOW} | "
+          f"Green → GPIO{GPIO_LED_GREEN} | "
           f"Servo → GPIO{GPIO_SERVO}")
 
 
@@ -84,9 +93,9 @@ def send_gpio_command(door: str, led: str):
     Args:
         door : "open"  → servo sweeps to  0° (door opens)
                "close" → servo sweeps to 90° (door closes)
-        led  : "red"   → Red ON,  Green OFF  (high humidity)
-               "green" → Red OFF, Green ON   (low  humidity)
-               "off"   → both OFF            (optimal humidity)
+        led  : "green"  → Green ON,  Yellow OFF, Red OFF  (good air quality)
+               "yellow" → Yellow ON, Green OFF, Red OFF   (medium air quality)
+               "red"    → Red ON,    Yellow OFF, Green OFF (bad air quality)
     """
     if not GPIO_AVAILABLE:
         return
@@ -95,18 +104,19 @@ def send_gpio_command(door: str, led: str):
     target_angle = 90 if door == "close" else 0
     _sweep_servo(target_angle)
 
-    # ── LEDs ──────────────────────────────────────────────────────────────────
+    # ── Air quality LEDs — only one on at a time ───────────────────────────────
+    _red_led.off()
+    _yellow_led.off()
+    _green_led.off()
+
     if led == "red":
         _red_led.on()
-        _green_led.off()
-    elif led == "green":
-        _red_led.off()
+    elif led == "yellow":
+        _yellow_led.on()
+    else:   # "green" — good air quality
         _green_led.on()
-    else:   # "off" — optimal humidity range
-        _red_led.off()
-        _green_led.off()
 
-    print(f"🔌 GPIO | Door: {door.upper()} ({target_angle}°) | LED: {led.upper()}")
+    print(f"🔌 GPIO | Door: {door.upper()} ({target_angle}°) | Air LED: {led.upper()}")
 
 
 def run_agent_pipeline(sensor_payload):
@@ -148,13 +158,13 @@ def run_agent_pipeline(sensor_payload):
     # Door: close on elevated or high vibration, open when normal
     door_cmd = "close" if analysis.vibration_status in ("elevated", "high") else "open"
 
-    # LED: red on high humidity, green on low humidity, off when optimal
-    if analysis.humidity_status in ("humid", "too_humid"):
-        led_cmd = "red"
-    elif analysis.humidity_status in ("dry", "too_dry"):
-        led_cmd = "green"
+    # Air quality traffic-light LED
+    if air_quality < AIR_QUALITY_GOOD:
+        led_cmd = "green"    # clean air
+    elif air_quality < AIR_QUALITY_MEDIUM:
+        led_cmd = "yellow"   # moderate air
     else:
-        led_cmd = "off"
+        led_cmd = "red"      # poor air
 
     send_gpio_command(door_cmd, led_cmd)
 
