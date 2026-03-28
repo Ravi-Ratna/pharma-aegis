@@ -2,25 +2,38 @@ from flask import Flask, jsonify, render_template_string, request
 import serial
 import json
 import time
+
 from threading import Thread, Lock
 import platform
 import random
 from agents import data_analyzer, risk_evaluator, decision_agent, action_agent
 from models import SensorReading
 
+# ── Raspberry Pi 4B GPIO via gpiozero (pre-installed on Pi OS Bookworm) ──────
+# Falls back gracefully so the app still runs on a dev machine without a Pi.
+try:
+    from gpiozero import LED, AngularServo
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+
 app = Flask(__name__)
 
-PORT = 'COM5'
+# On Raspberry Pi the ESP32 shows up as /dev/ttyUSB0 or /dev/ttyACM0.
+# find_preferred_port() auto-detects it, this is just the fallback.
+PORT = '/dev/ttyUSB0'
 BAUD = 115200
 
-# ── Arduino Door Controller serial config ────────────────────────────────────
-# Change ARDUINO_PORT to whichever COM port your Arduino is on
-ARDUINO_PORT = 'COM6'
-ARDUINO_BAUD = 9600
+# ── Raspberry Pi GPIO pin config (BCM numbering) ─────────────────────────────
+GPIO_LED_RED   = 17   # Physical pin 11  →  Red LED   (high humidity)
+GPIO_LED_GREEN = 27   # Physical pin 13  →  Green LED (low humidity)
+GPIO_SERVO     = 18   # Physical pin 12  →  Servo signal (hardware PWM)
 
 ser = None
-arduino_ser = None
-arduino_lock = Lock()
+_red_led     = None   # gpiozero LED object
+_green_led   = None   # gpiozero LED object
+_door_servo  = None   # gpiozero AngularServo object
+_servo_angle = 0      # tracks current angle so sweep knows where to start
 latest_data = {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": "N/A"}
 latest_analysis = {
     "sensor_data": {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": ""},
@@ -33,41 +46,67 @@ data_lock = Lock()
 connection_status = "⏳ Initializing..."
 
 
-def connect_arduino():
-    """Try to open a serial connection to the Arduino door controller."""
-    global arduino_ser
-    try:
-        arduino_ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
-        time.sleep(2)  # Wait for Arduino bootloader to finish
-        print(f"✅ Arduino door controller connected on {ARDUINO_PORT}")
-    except Exception as e:
-        print(f"⚠️  Arduino not found on {ARDUINO_PORT}: {e}")
-        print(f"   → Door controller commands will be skipped until reconnected")
-        arduino_ser = None
+def setup_gpio():
+    """Initialise gpiozero devices for the servo and both LEDs."""
+    global _red_led, _green_led, _door_servo
+    if not GPIO_AVAILABLE:
+        print("⚠️  gpiozero not available — GPIO disabled (running in dev mode)")
+        return
+    _red_led   = LED(GPIO_LED_RED)
+    _green_led = LED(GPIO_LED_GREEN)
+    # AngularServo: min_angle=0 (door open), max_angle=90 (door closed)
+    # Pulse widths tuned for SG90 / MG90S servos — common with Pi projects
+    _door_servo = AngularServo(GPIO_SERVO,
+                               min_angle=0, max_angle=90,
+                               min_pulse_width=0.001, max_pulse_width=0.002)
+    _door_servo.angle = 0   # park door open on boot
+    print(f"✅ GPIO ready — Pi 4B | "
+          f"Red LED → GPIO{GPIO_LED_RED} | "
+          f"Green LED → GPIO{GPIO_LED_GREEN} | "
+          f"Servo → GPIO{GPIO_SERVO}")
 
 
-def send_arduino_command(door: str, led: str):
-    """Send a JSON command line to the Arduino door controller.
+def _sweep_servo(target: int):
+    """Step the servo one degree at a time for smooth, jerk-free movement."""
+    global _servo_angle
+    if _door_servo is None:
+        return
+    step = 1 if target > _servo_angle else -1
+    while _servo_angle != target:
+        _servo_angle += step
+        _door_servo.angle = _servo_angle
+        time.sleep(0.015)   # 15 ms per degree → ~1.35 s for full 0–90° sweep
+
+
+def send_gpio_command(door: str, led: str):
+    """Drive GPIO from agent analysis results.
 
     Args:
-        door: "open" | "close"
-        led:  "red"  | "green" | "off"
+        door : "open"  → servo sweeps to  0° (door opens)
+               "close" → servo sweeps to 90° (door closes)
+        led  : "red"   → Red ON,  Green OFF  (high humidity)
+               "green" → Red OFF, Green ON   (low  humidity)
+               "off"   → both OFF            (optimal humidity)
     """
-    global arduino_ser
-    cmd = json.dumps({"door": door, "led": led}) + "\n"
+    if not GPIO_AVAILABLE:
+        return
 
-    with arduino_lock:
-        if arduino_ser and arduino_ser.is_open:
-            try:
-                arduino_ser.write(cmd.encode())
-            except Exception as e:
-                print(f"⚠️  Arduino send error: {e} — will skip future commands")
-                try:
-                    arduino_ser.close()
-                except Exception:
-                    pass
-                arduino_ser = None
-        # Silently skip if Arduino is not connected
+    # ── Servo ─────────────────────────────────────────────────────────────────
+    target_angle = 90 if door == "close" else 0
+    _sweep_servo(target_angle)
+
+    # ── LEDs ──────────────────────────────────────────────────────────────────
+    if led == "red":
+        _red_led.on()
+        _green_led.off()
+    elif led == "green":
+        _red_led.off()
+        _green_led.on()
+    else:   # "off" — optimal humidity range
+        _red_led.off()
+        _green_led.off()
+
+    print(f"🔌 GPIO | Door: {door.upper()} ({target_angle}°) | LED: {led.upper()}")
 
 
 def run_agent_pipeline(sensor_payload):
@@ -105,7 +144,7 @@ def run_agent_pipeline(sensor_payload):
     decision = decision_agent(risk)
     action = action_agent(decision, risk, analysis)
 
-    # ── Arduino door & LED commands derived from agent analysis ──────────────
+    # ── GPIO door & LED commands derived from agent analysis ─────────────────
     # Door: close on elevated or high vibration, open when normal
     door_cmd = "close" if analysis.vibration_status in ("elevated", "high") else "open"
 
@@ -117,8 +156,7 @@ def run_agent_pipeline(sensor_payload):
     else:
         led_cmd = "off"
 
-    send_arduino_command(door_cmd, led_cmd)
-    print(f"🚪 Arduino | Door: {door_cmd.upper()} | LED: {led_cmd.upper()}")
+    send_gpio_command(door_cmd, led_cmd)
 
     # Include original ESP32 data in response (air quality, fire, vibration)
     sensor_data_out = {
@@ -844,9 +882,8 @@ def stream():
 
 
 if __name__ == "__main__":
-    # Connect to Arduino door controller (non-blocking — failure is OK)
-    arduino_thread = Thread(target=connect_arduino, daemon=True)
-    arduino_thread.start()
+    # Initialise Raspberry Pi GPIO pins (servo + LEDs)
+    setup_gpio()
 
     # Start ESP32 sensor reading in background thread
     sensor_thread = Thread(target=read_sensor, daemon=True)
@@ -854,7 +891,7 @@ if __name__ == "__main__":
 
     print("\n🚀 Starting Pharma Aegis Dashboard...")
     print("📊 Open your browser: http://localhost:5000")
-    print(f"🚪 Arduino door controller port: {ARDUINO_PORT}")
+    print("🔌 GPIO control active — Servo BCM18 | Red BCM17 | Green BCM27")
     print("=" * 50)
 
     app.run(host="0.0.0.0", port=5000, debug=False)
