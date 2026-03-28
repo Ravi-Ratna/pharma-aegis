@@ -5,7 +5,7 @@ import time
 from threading import Thread, Lock
 import platform
 import random
-from agents import data_analyzer, risk_evaluator, decision_agent
+from agents import data_analyzer, risk_evaluator, decision_agent, action_agent
 from models import SensorReading
 
 app = Flask(__name__)
@@ -19,11 +19,51 @@ latest_data = {"status": "Waiting for connection...", "timestamp": "N/A"}
 latest_analysis = {
     "analysis": {"temperature": "normal", "humidity": "normal", "vibration": "normal", "fire": "safe", "anomaly_score": 0},
     "risk": {"level": "LOW", "reason": "Initializing..."},
-    "decision": {"action": "MONITOR", "requires_human": False}
+    "decision": {"action": "MONITOR", "requires_human": False},
+    "action": {"led": "GREEN_SOLID", "buzzer": "OFF", "log_level": "INFO", "log_message": "Initializing..."}
 }
 data_lock = Lock()
 connection_status = "⏳ Initializing..."
 demo_enabled = DEMO_MODE
+
+
+def run_agent_pipeline(sensor_payload):
+    """Run all 4 agents and build a normalized output bundle."""
+    reading = SensorReading(
+        temperature=float(sensor_payload.get("temperature", 20.0)),
+        humidity=float(sensor_payload.get("humidity", 50.0)),
+        vibration=float(sensor_payload.get("vibration", 1.0)),
+        fire=int(sensor_payload.get("fire", 0)),
+    )
+
+    analysis = data_analyzer(reading)
+    risk = risk_evaluator(analysis)
+    decision = decision_agent(risk)
+    action = action_agent(decision, risk, analysis)
+
+    return {
+        "analysis": {
+            "temperature": analysis.temperature_status,
+            "humidity": analysis.humidity_status,
+            "vibration": analysis.vibration_status,
+            "fire": analysis.fire_status,
+            "anomaly_score": analysis.anomaly_score,
+        },
+        "risk": {
+            "level": risk.risk_level,
+            "reason": risk.reason,
+        },
+        "decision": {
+            "action": decision.decision,
+            "requires_human": decision.requires_human,
+        },
+        "action": {
+            "led": action.led,
+            "buzzer": action.buzzer,
+            "log_level": action.log_level,
+            "log_message": action.log_message,
+        },
+    }
 
 def find_com_ports():
     """Find available COM ports"""
@@ -366,36 +406,15 @@ def read_sensor():
                     "fire": fire,
                     "timestamp": time.strftime('%H:%M:%S')
                 }
-                
-                # Run analysis
-                reading = SensorReading(
-                    temperature=temp,
-                    humidity=humid,
-                    vibration=vib,
-                    fire=fire
-                )
-                analysis = data_analyzer(reading)
-                risk = risk_evaluator(analysis)
-                decision = decision_agent(risk)
-                
-                latest_analysis = {
-                    "analysis": {
-                        "temperature": analysis.temperature_status,
-                        "humidity": analysis.humidity_status,
-                        "vibration": analysis.vibration_status,
-                        "fire": analysis.fire_status,
-                        "anomaly_score": analysis.anomaly_score
-                    },
-                    "risk": {
-                        "level": risk.risk_level,
-                        "reason": risk.reason
-                    },
-                    "decision": {
-                        "action": decision.decision,
-                        "requires_human": decision.requires_human
-                    }
-                }
-            print(f"[DEMO #{demo_counter}] Temp: {temp}°C, Humidity: {humid}%, Vibration: {vib} | Risk: {risk.risk_level}")
+
+                latest_analysis = run_agent_pipeline(latest_data)
+
+            print(
+                f"[DEMO #{demo_counter}] Temp: {temp}°C, Humidity: {humid}%, Vibration: {vib} "
+                f"| Risk: {latest_analysis['risk']['level']} "
+                f"| LED: {latest_analysis['action']['led']} "
+                f"| Buzzer: {latest_analysis['action']['buzzer']}"
+            )
             time.sleep(1)
         return
     
@@ -436,7 +455,15 @@ def read_sensor():
                             with data_lock:
                                 latest_data = data
                                 latest_data['timestamp'] = time.strftime('%H:%M:%S')
+                                latest_analysis = run_agent_pipeline(latest_data)
                             print(f"✅ Updated: {latest_data}")
+                            print(
+                                f"🧠 Agents | Risk: {latest_analysis['risk']['level']} "
+                                f"| Decision: {latest_analysis['decision']['action']} "
+                                f"| LED: {latest_analysis['action']['led']} "
+                                f"| Buzzer: {latest_analysis['action']['buzzer']}"
+                            )
+                            print(f"📝 {latest_analysis['action']['log_level']}: {latest_analysis['action']['log_message']}")
                         except Exception as e:
                             print(f"Parse error: {e}")
             break  # Exit port loop if successful
@@ -500,6 +527,7 @@ def stream():
                     "analysis": latest_analysis["analysis"] if latest_analysis else {},
                     "risk": latest_analysis["risk"] if latest_analysis else {},
                     "decision": latest_analysis["decision"] if latest_analysis else {},
+                    "action": latest_analysis["action"] if latest_analysis else {},
                     "demo_mode": demo_enabled
                 }
             yield f"data: {json.dumps(response_data)}\n\n"

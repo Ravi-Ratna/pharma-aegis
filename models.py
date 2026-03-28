@@ -33,3 +33,12 @@ class DecisionResult:
     """Decision/action from risk assessment"""
     decision: str  # MONITOR, CHECK_DOOR, ALERT_AND_STABILIZE, TRIGGER_EMERGENCY
     requires_human: bool
+
+
+@dataclass
+class ActionResult:
+    """Action output for external systems (dashboard, LED/buzzer, logs)"""
+    led: str
+    buzzer: str
+    log_level: str
+    log_message: str
