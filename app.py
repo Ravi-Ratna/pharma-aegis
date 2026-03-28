@@ -35,12 +35,16 @@ AIR_QUALITY_GOOD   = 450   # below this        → Green  (clean air)
 AIR_QUALITY_MEDIUM = 800   # 450–800           → Yellow (moderate)
                            # 800 and above     → Red    (poor air)
 
+# ── Servo door angles ─────────────────────────────────────────────────────────
+DOOR_CLOSED_ANGLE = 0    # 0°  — secured/closed position
+DOOR_OPEN_ANGLE   = 35   # 35° — normal resting/open position
+
 ser = None
 _red_led     = None   # gpiozero LED object
 _yellow_led  = None   # gpiozero LED object
 _green_led   = None   # gpiozero LED object
 _door_servo  = None   # gpiozero AngularServo object
-_servo_angle = 0      # tracks current angle so sweep knows where to start
+_servo_angle = DOOR_CLOSED_ANGLE  # start closed; updated by _sweep_servo on every move
 latest_data = {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": "N/A"}
 latest_analysis = {
     "sensor_data": {"air_quality": 0, "fire": 0, "vibration": 0, "timestamp": ""},
@@ -91,8 +95,9 @@ def send_gpio_command(door: str, led: str):
     """Drive GPIO from agent analysis results.
 
     Args:
-        door : "open"  → servo sweeps to  0° (door opens)
-               "close" → servo sweeps to 90° (door closes)
+        door : "close" → servo sweeps to DOOR_CLOSED_ANGLE (0°)
+                         if already at 0°, skip — no movement needed
+               "open"  → servo sweeps to DOOR_OPEN_ANGLE (35°)
         led  : "green"  → Green ON,  Yellow OFF, Red OFF  (good air quality)
                "yellow" → Yellow ON, Green OFF, Red OFF   (medium air quality)
                "red"    → Red ON,    Yellow OFF, Green OFF (bad air quality)
@@ -101,8 +106,18 @@ def send_gpio_command(door: str, led: str):
         return
 
     # ── Servo ─────────────────────────────────────────────────────────────────
-    target_angle = 90 if door == "close" else 0
-    _sweep_servo(target_angle)
+    if door == "close":
+        if _servo_angle > DOOR_CLOSED_ANGLE:
+            # Door is open at any angle > 0 — vibration detected, close it back to 0°
+            angle_before = _servo_angle
+            _sweep_servo(DOOR_CLOSED_ANGLE)
+            print(f"🚪 GPIO | Vibration detected — Door closed ({angle_before}° → {DOOR_CLOSED_ANGLE}°)")
+        else:
+            # Already at 0° — door is secure, nothing to do
+            print(f"🔒 GPIO | Door already at 0° — no movement needed")
+    else:  # "open"
+        _sweep_servo(DOOR_OPEN_ANGLE)
+        print(f"🚪 GPIO | Door opened to {DOOR_OPEN_ANGLE}°")
 
     # ── Air quality LEDs — only one on at a time ───────────────────────────────
     _red_led.off()
@@ -116,7 +131,7 @@ def send_gpio_command(door: str, led: str):
     else:   # "green" — good air quality
         _green_led.on()
 
-    print(f"🔌 GPIO | Door: {door.upper()} ({target_angle}°) | Air LED: {led.upper()}")
+    print(f"🔌 GPIO | Air LED: {led.upper()}")
 
 
 def run_agent_pipeline(sensor_payload):
